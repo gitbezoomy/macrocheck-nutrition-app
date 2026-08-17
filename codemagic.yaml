@@ -1,0 +1,75 @@
+workflows:
+  ios-build:
+    name: iOS Build for Sideloading
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    triggering:
+      events: []
+      branch_patterns:
+        - pattern: '*'
+          include: false
+    environment:
+      flutter: stable
+      groups:
+        - api_keys
+    scripts:
+      - name: Recreate secrets.dart
+        script: |
+          mkdir -p lib/config
+          cat <<EOF > lib/config/secrets.dart
+          class Secrets {
+            static const String fatSecretClientId = '\$FATSECRET_CLIENT_ID';
+            static const String fatSecretClientSecret = '\$FATSECRET_CLIENT_SECRET';
+          }
+          EOF
+          cat <<EOF > lib/config/env.dart
+          import 'secrets.dart';
+          class EnvConfig {
+            static const String fatSecretClientId = Secrets.fatSecretClientId;
+            static const String fatSecretClientSecret = Secrets.fatSecretClientSecret;
+          }
+          EOF
+      - name: Fetch Flutter dependencies
+        script: flutter pub get
+      - name: Install CocoaPods
+        script: |
+          cd ios
+          pod install
+      - name: Build iOS App (Unsigned)
+        script: |
+          set -e
+          set -o pipefail
+          
+          # 1. Manual Preparation
+          flutter precache --ios
+          
+          # 2. Force Deployment Target and Strip Signing
+          find ios -name "project.pbxproj" -exec sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [^;]*;/IPHONEOS_DEPLOYMENT_TARGET = 13.0;/g' {} +
+          find ios -name "project.pbxproj" -exec sed -i '' 's/DEVELOPMENT_TEAM = [^;]*;//g' {} +
+          find ios -name "project.pbxproj" -exec sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' {} +
+          find ios -name "project.pbxproj" -exec sed -i '' 's/CODE_SIGN_IDENTITY = [^;]*;/CODE_SIGN_IDENTITY = "";/g' {} +
+          
+          # 3. Direct Xcode Build (Optimized for Sideloading)
+          echo "Starting xcodebuild build..."
+          xcodebuild -workspace ios/Runner.xcworkspace \
+                     -scheme Runner \
+                     -configuration Release \
+                     -sdk iphoneos \
+                     -destination 'generic/platform=iOS' \
+                     CODE_SIGNING_ALLOWED=NO \
+                     CODE_SIGNING_REQUIRED=NO \
+                     CODE_SIGNING_ENTITLEMENTS="" \
+                     CODE_SIGN_IDENTITY="" \
+                     PROVISIONING_PROFILE_SPECIFIER="" \
+                     AD_HOC_CODE_SIGNING_ALLOWED=NO \
+                     COMPILER_INDEX_STORE_ENABLE=NO \
+                     OBJROOT=$PWD/build/ios/obj \
+                     SYMROOT=$PWD/build/ios/sym \
+                     build 2>&1 | tee xcodebuild.log || (echo "BUILD FAILED! Last 100 lines:" && tail -n 100 xcodebuild.log && exit 1)
+          
+          # 4. Extract and zip
+          mkdir -p build/ios/iphoneos/Payload
+          cp -r build/ios/sym/Release-iphoneos/Runner.app build/ios/iphoneos/Payload/
+          cd build/ios/iphoneos && zip -r macrocheck.ipa Payload
+    artifacts:
+      - build/ios/iphoneos/macrocheck.ipa
